@@ -7,21 +7,6 @@ function getDb() {
   return createClient(url, key);
 }
 
-// Parse NeoXR check response — might be JSON or plain string ("paid"/"pending"/etc)
-function parseCheckStatus(rawText) {
-  const trimmed = (rawText || '').trim().toLowerCase();
-  try {
-    const j = JSON.parse(rawText);
-    const s = (j?.data?.status || j?.status || '').toLowerCase();
-    return s;
-  } catch (_) { /* not JSON */ }
-  // Plain string: "paid", "pending", "expired", "failed", "success"
-  return trimmed;
-}
-
-const PAID_STATUSES   = new Set(['paid','success','completed','settlement']);
-const FAILED_STATUSES = new Set(['expired','failed','cancelled','cancel','deny','failure']);
-
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -34,9 +19,12 @@ export default async function handler(req, res) {
     const { txn_id } = req.body || {};
     if (!txn_id) return res.status(400).json({ error: 'txn_id diperlukan' });
 
+    const apiKey = process.env.TAKO_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'TAKO_API_KEY belum dikonfigurasi' });
+
     const db = getDb();
 
-    // Fetch order
+    // Fetch order from DB
     const { data: orders, error: oErr } = await db
       .from('orders')
       .select('*')
@@ -44,11 +32,12 @@ export default async function handler(req, res) {
       .limit(1);
 
     if (oErr) return res.status(500).json({ error: oErr.message });
-    if (!orders || orders.length === 0) return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
+    if (!orders || orders.length === 0)
+      return res.status(404).json({ error: 'Transaksi tidak ditemukan' });
 
     const order = orders[0];
 
-    // Already resolved
+    // Already resolved — return accounts
     if (order.status === 'paid') {
       const { data: pool } = await db
         .from('account_pool')
@@ -56,10 +45,7 @@ export default async function handler(req, res) {
         .eq('order_id', order.id);
 
       const { data: prodRows } = await db
-        .from('products')
-        .select('rules')
-        .eq('id', order.product_id)
-        .limit(1);
+        .from('products').select('rules').eq('id', order.product_id).limit(1);
 
       const rules = prodRows?.[0]?.rules || '';
       const accounts = (pool || []).map(a => ({ ...a.account_data, ...(rules ? { rules } : {}) }));
@@ -70,30 +56,43 @@ export default async function handler(req, res) {
       return res.status(200).json({ status: order.status });
     }
 
-    // Query gateway
-    const apiKey = process.env.TAKO_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: 'TAKO_API_KEY belum dikonfigurasi' });
+    // === NeoXR tako-check — GET request ===
+    const checkUrl = `https://api.neoxr.eu/api/tako-check`
+      + `?id=${encodeURIComponent(txn_id)}`
+      + `&apikey=${encodeURIComponent(apiKey)}`;
 
-    const checkUrl = `https://api.neoxr.eu/api/tako-check?id=${encodeURIComponent(txn_id)}&apikey=${encodeURIComponent(apiKey)}`;
-
-    let rawText = '';
+    let gwJson;
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10_000);
-      const gwRes = await fetch(checkUrl, { signal: controller.signal });
-      clearTimeout(timeout);
-      rawText = await gwRes.text();
+      const t = setTimeout(() => controller.abort(), 12_000);
+      const gwRes = await fetch(checkUrl, { method: 'GET', signal: controller.signal });
+      clearTimeout(t);
+
+      const rawText = await gwRes.text();
+      console.log('NeoXR check raw:', rawText.slice(0, 200));
+
+      try {
+        gwJson = JSON.parse(rawText);
+      } catch (_) {
+        // If gateway returns non-JSON, assume still pending
+        console.error('NeoXR check non-JSON:', rawText.slice(0, 120));
+        return res.status(200).json({ status: 'pending', message: 'Gateway belum merespon' });
+      }
     } catch (fetchErr) {
-      // Network error — return pending so user can retry
-      console.error('Gateway check fetch error:', fetchErr.message);
-      return res.status(200).json({ status: 'pending', message: 'Cek koneksi gateway, coba lagi' });
+      console.error('NeoXR check fetch error:', fetchErr.message);
+      return res.status(200).json({ status: 'pending', message: 'Coba lagi sebentar' });
     }
 
-    console.log('Check gateway response:', rawText.slice(0, 200));
-    const payStatus = parseCheckStatus(rawText);
+    // NeoXR check response:
+    // Paid:    { status: true,  msg: "BERHASIL" }
+    // Pending: { status: false, msg: "TRANSAKSI TIDAK TERDAFTAR ATAU BELUM TERSELESAIKAN" }
+    const isPaid = gwJson?.status === true &&
+      (gwJson?.msg?.toUpperCase?.()?.includes('BERHASIL') ||
+       gwJson?.msg?.toUpperCase?.()?.includes('SUCCESS') ||
+       gwJson?.msg?.toUpperCase?.()?.includes('PAID'));
 
-    if (PAID_STATUSES.has(payStatus)) {
-      // Claim accounts atomically
+    if (isPaid) {
+      // Claim accounts
       const { data: pool, error: pErr } = await db
         .from('account_pool')
         .select('id, account_data')
@@ -112,7 +111,6 @@ export default async function handler(req, res) {
           .update({ used: true, order_id: order.id, used_at: now })
           .in('id', ids);
       }
-
       await db.from('orders').update({ status: 'paid', paid_at: now }).eq('id', order.id);
 
       const { data: prodRows } = await db.from('products').select('rules').eq('id', order.product_id).limit(1);
@@ -126,14 +124,11 @@ export default async function handler(req, res) {
       });
     }
 
-    if (FAILED_STATUSES.has(payStatus)) {
-      await db.from('orders').update({ status: 'expired' }).eq('id', order.id);
-      return res.status(200).json({ status: 'expired' });
-    }
+    // Still pending
+    return res.status(200).json({ status: 'pending', msg: gwJson?.msg || '' });
 
-    return res.status(200).json({ status: 'pending' });
   } catch (err) {
-    console.error('Check error:', err);
+    console.error('Check unhandled error:', err);
     return res.status(500).json({ error: err.message || 'Internal server error' });
   }
-        }
+}
