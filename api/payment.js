@@ -15,43 +15,6 @@ const DURATION_LABELS = {
 
 function validateEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 
-// Parse NeoXR response — handles both JSON and plain-string formats
-function parseGatewayResponse(rawText) {
-  const trimmed = (rawText || '').trim();
-
-  // Try JSON first
-  try {
-    const j = JSON.parse(trimmed);
-    // Check for error in JSON
-    if (j?.status === false || j?.error || j?.message?.toLowerCase?.().includes('error')) {
-      return { error: j?.message || j?.error || 'Gateway menolak request' };
-    }
-    const id = j?.data?.id || j?.id || j?.transaction_id;
-    const qr = j?.data?.qr_image || j?.qr_image || j?.data?.qr || j?.qr || j?.data?.image;
-    if (id && qr) return { txnId: String(id), qrImage: String(qr) };
-    return { error: 'Response gateway tidak lengkap: ' + trimmed.slice(0, 120) };
-  } catch (_) { /* not JSON, continue */ }
-
-  // Plain string handling — NeoXR sometimes returns "id|qrImageUrl" or just the QR
-  if (!trimmed) return { error: 'Gateway mengembalikan response kosong' };
-
-  // Format: "txnId|qrImageData"
-  if (trimmed.includes('|')) {
-    const [id, ...rest] = trimmed.split('|');
-    const qr = rest.join('|');
-    if (id && qr) return { txnId: id.trim(), qrImage: qr.trim() };
-  }
-
-  // Format: just QR image (base64 or URL)
-  if (trimmed.startsWith('data:image') || trimmed.startsWith('http')) {
-    const txnId = `TKN_${Date.now()}_${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
-    return { txnId, qrImage: trimmed };
-  }
-
-  // Looks like an error message
-  return { error: 'Gateway error: ' + trimmed.slice(0, 200) };
-}
-
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -71,16 +34,15 @@ export default async function handler(req, res) {
     if (!qty || qty < 1 || qty > 20)
       return res.status(400).json({ error: 'Jumlah akun harus antara 1–20' });
 
-    const db = getDb();
-
-    // Validate env vars for gateway
     const merchant = process.env.TAKO_MERCHANT;
     const apiKey   = process.env.TAKO_API_KEY;
     if (!merchant || !apiKey)
-      return res.status(500).json({ error: 'TAKO_MERCHANT / TAKO_API_KEY belum dikonfigurasi di environment variables' });
+      return res.status(500).json({ error: 'TAKO_MERCHANT / TAKO_API_KEY belum dikonfigurasi' });
+
+    const db = getDb();
 
     // Fetch product
-    const { data: product, error: pErr } = await db
+    const { data: rows, error: pErr } = await db
       .from('products')
       .select('id, name, category, prices, rules')
       .eq('id', product_id)
@@ -88,9 +50,10 @@ export default async function handler(req, res) {
       .limit(1);
 
     if (pErr) return res.status(500).json({ error: pErr.message });
-    if (!product || product.length === 0) return res.status(404).json({ error: 'Produk tidak ditemukan atau tidak aktif' });
+    if (!rows || rows.length === 0)
+      return res.status(404).json({ error: 'Produk tidak ditemukan atau tidak aktif' });
 
-    const prod = product[0];
+    const prod  = rows[0];
     const price = prod.prices?.[duration];
     if (!price) return res.status(400).json({ error: 'Durasi tidak tersedia untuk produk ini' });
 
@@ -106,35 +69,54 @@ export default async function handler(req, res) {
     if (stockCount < qty)
       return res.status(400).json({ error: `Stok tidak cukup. Tersedia: ${stockCount}, diminta: ${qty}` });
 
-    const total   = price * qty;
-    const msgText = `${prod.name} x${qty} ${DURATION_LABELS[duration] || duration}`;
+    const total    = price * qty;
+    const durLabel = DURATION_LABELS[duration] || duration;
+    // message = "nama produk x jumlah durasi"  (max ~40 chars for gateway)
+    const msgText  = `${prod.name} x${qty} ${durLabel}`.slice(0, 40);
 
-    // Call NeoXR gateway — GET request, returns string or JSON
+    // === NeoXR tako-create — GET request ===
+    // amount = total price * quantity already computed as total
     const gatewayUrl = `https://api.neoxr.eu/api/tako-create`
       + `?username=${encodeURIComponent(merchant)}`
       + `&amount=${total}`
       + `&message=${encodeURIComponent(msgText)}`
       + `&apikey=${encodeURIComponent(apiKey)}`;
 
-    let gatewayText = '';
+    let gwJson;
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12_000);
-      const payRes = await fetch(gatewayUrl, { signal: controller.signal });
-      clearTimeout(timeout);
-      gatewayText = await payRes.text(); // Always read as text first
+      const t = setTimeout(() => controller.abort(), 15_000);
+      const gwRes = await fetch(gatewayUrl, { method: 'GET', signal: controller.signal });
+      clearTimeout(t);
+
+      // Always read as text first to avoid JSON parse crash
+      const rawText = await gwRes.text();
+      console.log('NeoXR create raw (200 chars):', rawText.slice(0, 200));
+
+      try {
+        gwJson = JSON.parse(rawText);
+      } catch (_) {
+        return res.status(502).json({ error: 'Gateway mengembalikan respon bukan JSON: ' + rawText.slice(0, 120) });
+      }
     } catch (fetchErr) {
-      return res.status(502).json({ error: 'Gagal menghubungi gateway pembayaran: ' + fetchErr.message });
+      return res.status(502).json({ error: 'Gagal menghubungi gateway: ' + fetchErr.message });
     }
 
-    console.log('Gateway raw response (first 300):', gatewayText.slice(0, 300));
+    // Validate gateway response using NeoXR exact format
+    if (!gwJson?.status) {
+      const msg = gwJson?.msg || gwJson?.message || JSON.stringify(gwJson).slice(0, 120);
+      return res.status(502).json({ error: 'Gateway error: ' + msg });
+    }
 
-    const parsed = parseGatewayResponse(gatewayText);
-    if (parsed.error) return res.status(502).json({ error: parsed.error });
+    const txnId   = gwJson?.data?.id;
+    const qrImage = gwJson?.data?.qr_image;
 
-    const { txnId, qrImage } = parsed;
+    if (!txnId || !qrImage) {
+      console.error('NeoXR missing fields:', JSON.stringify(gwJson).slice(0, 300));
+      return res.status(502).json({ error: 'Gateway tidak mengembalikan id/qr_image' });
+    }
 
-    // Save order
+    // Save order to Supabase
     const { error: oErr } = await db.from('orders').insert({
       txn_id:         txnId,
       product_id:     prod.id,
@@ -143,24 +125,29 @@ export default async function handler(req, res) {
       email:          email.toLowerCase().trim(),
       whatsapp:       whatsapp.trim(),
       duration,
-      duration_label: DURATION_LABELS[duration] || duration,
+      duration_label: durLabel,
       quantity:       qty,
       total,
       status: 'pending',
     });
 
     if (oErr) {
-      console.error('Order insert error:', oErr);
-      // If order save fails, still return QR so user can pay
-      // (order might be a duplicate if they retry)
-      if (!oErr.code?.includes('duplicate') && !oErr.message?.includes('duplicate')) {
+      // Ignore duplicate key (user re-submitted same payment)
+      if (!oErr.code?.includes('23505') && !oErr.message?.includes('duplicate')) {
+        console.error('Order insert error:', oErr);
         return res.status(500).json({ error: 'Gagal menyimpan pesanan: ' + oErr.message });
       }
     }
 
-    return res.status(200).json({ txn_id: txnId, qr_image: qrImage, total });
+    return res.status(200).json({
+      txn_id:   txnId,
+      qr_image: qrImage,
+      pay_url:  gwJson?.data?.url || null,
+      total,
+    });
+
   } catch (err) {
-    console.error('Payment error:', err);
+    console.error('Payment unhandled error:', err);
     return res.status(500).json({ error: err.message || 'Internal server error' });
   }
-  }
+}
