@@ -7,13 +7,13 @@ function getDb() {
   return createClient(url, key);
 }
 
-const DURATION_LABELS = {
+const DUR = {
   '1d':'1 Hari','3d':'3 Hari','7d':'1 Minggu','10d':'10 Hari',
   '15d':'15 Hari','20d':'20 Hari','1m':'1 Bulan','3m':'3 Bulan',
   '6m':'6 Bulan','1y':'1 Tahun',
 };
 
-function validateEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
+const validateEmail = e => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 
 export default async function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
@@ -32,122 +32,102 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Format email tidak valid' });
     const qty = parseInt(quantity, 10);
     if (!qty || qty < 1 || qty > 20)
-      return res.status(400).json({ error: 'Jumlah akun harus antara 1–20' });
+      return res.status(400).json({ error: 'Jumlah akun 1–20' });
 
-    const merchant = process.env.TAKO_MERCHANT;
-    const apiKey   = process.env.TAKO_API_KEY;
-    if (!merchant || !apiKey)
-      return res.status(500).json({ error: 'TAKO_MERCHANT / TAKO_API_KEY belum dikonfigurasi' });
+    const qrisKey = process.env.QRIS_API_KEY;
+    const qrisMerchant = process.env.QRIS_MERCHANT_ID;
+    if (!qrisKey) return res.status(500).json({ error: 'QRIS_API_KEY belum dikonfigurasi' });
 
     const db = getDb();
 
     // Fetch product
     const { data: rows, error: pErr } = await db
-      .from('products')
-      .select('id, name, category, prices, rules')
-      .eq('id', product_id)
-      .eq('active', true)
-      .limit(1);
-
-    if (pErr) return res.status(500).json({ error: pErr.message });
-    if (!rows || rows.length === 0)
-      return res.status(404).json({ error: 'Produk tidak ditemukan atau tidak aktif' });
+      .from('products').select('id,name,category,prices,rules')
+      .eq('id', product_id).eq('active', true).limit(1);
+    if (pErr || !rows?.length) return res.status(404).json({ error: 'Produk tidak ditemukan' });
 
     const prod  = rows[0];
     const price = prod.prices?.[duration];
-    if (!price) return res.status(400).json({ error: 'Durasi tidak tersedia untuk produk ini' });
+    if (!price) return res.status(400).json({ error: 'Durasi tidak tersedia' });
 
-    // Check stock
-    const { data: stockRows, error: sErr } = await db
-      .from('account_pool')
-      .select('id')
-      .eq('product_id', product_id)
-      .eq('used', false);
+    // Check stock (duration-specific first, then any)
+    const { data: stockRows } = await db.from('account_pool')
+      .select('id').eq('product_id', product_id).eq('used', false)
+      .or(`duration.eq.${duration},duration.is.null`)
+      .limit(qty);
+    if (!stockRows || stockRows.length < qty)
+      return res.status(400).json({ error: `Stok tidak cukup (tersedia: ${stockRows?.length||0})` });
 
-    if (sErr) return res.status(500).json({ error: sErr.message });
-    const stockCount = (stockRows || []).length;
-    if (stockCount < qty)
-      return res.status(400).json({ error: `Stok tidak cukup. Tersedia: ${stockCount}, diminta: ${qty}` });
+    // 1% QRIS fee
+    const baseTotal = price * qty;
+    const fee       = Math.ceil(baseTotal * 0.01);
+    const total     = baseTotal + fee;
+    const durLabel  = DUR[duration] || duration;
+    const desc      = `${prod.name} x${qty} ${durLabel}`.slice(0, 50);
 
-    const total    = price * qty;
-    const durLabel = DURATION_LABELS[duration] || duration;
-    // message = "nama produk x jumlah durasi"  (max ~40 chars for gateway)
-    const msgText  = `${prod.name} x${qty} ${durLabel}`.slice(0, 40);
+    // App URL for webhook
+    const appUrl = process.env.APP_URL || `https://${req.headers.host}`;
+    const webhookUrl = `${appUrl}/api/webhook`;
 
-    // === NeoXR tako-create — GET request ===
-    // amount = total price * quantity already computed as total
-    const gatewayUrl = `https://api.neoxr.eu/api/tako-create`
-      + `?username=${encodeURIComponent(merchant)}`
-      + `&amount=${total}`
-      + `&message=${encodeURIComponent(msgText)}`
-      + `&apikey=${encodeURIComponent(apiKey)}`;
-
-    let gwJson;
+    // === qris.pw API ===
+    let txnId, qrImage, expiredAt, payUrl;
     try {
+      const body = {
+        amount:       total,
+        description:  desc,
+        customer_email: email,
+        customer_phone: whatsapp,
+        callback_url:   webhookUrl,
+        expired_time:   5, // minutes
+        ...(qrisMerchant ? { merchant_id: qrisMerchant } : {}),
+      };
+
       const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 15_000);
-      const gwRes = await fetch(gatewayUrl, { method: 'GET', signal: controller.signal });
+      const t = setTimeout(() => controller.abort(), 15000);
+      const gwRes = await fetch('https://qris.pw/api/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${qrisKey}` },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
       clearTimeout(t);
 
-      // Always read as text first to avoid JSON parse crash
-      const rawText = await gwRes.text();
-      console.log('NeoXR create raw (200 chars):', rawText.slice(0, 200));
+      const raw = await gwRes.text();
+      console.log('qris.pw create response:', raw.slice(0, 300));
 
-      try {
-        gwJson = JSON.parse(rawText);
-      } catch (_) {
-        return res.status(502).json({ error: 'Gateway mengembalikan respon bukan JSON: ' + rawText.slice(0, 120) });
+      let gw;
+      try { gw = JSON.parse(raw); } catch(_) {
+        return res.status(502).json({ error: 'Gateway mengembalikan respon tidak valid: ' + raw.slice(0,100) });
       }
+
+      if (!gw?.success && !gw?.status) {
+        return res.status(502).json({ error: gw?.message || gw?.error || 'Gateway error' });
+      }
+
+      const d   = gw.data || gw;
+      txnId      = d.invoice_id || d.id || d.transaction_id || d.trx_id;
+      qrImage    = d.qr_image   || d.qr_code_image || d.image;
+      payUrl     = d.payment_url || d.pay_url || d.url;
+      expiredAt  = d.expired_at  || d.expire_time;
+
+      if (!txnId) return res.status(502).json({ error: 'Gateway tidak mengembalikan ID transaksi' });
     } catch (fetchErr) {
       return res.status(502).json({ error: 'Gagal menghubungi gateway: ' + fetchErr.message });
     }
 
-    // Validate gateway response using NeoXR exact format
-    if (!gwJson?.status) {
-      const msg = gwJson?.msg || gwJson?.message || JSON.stringify(gwJson).slice(0, 120);
-      return res.status(502).json({ error: 'Gateway error: ' + msg });
-    }
-
-    const txnId   = gwJson?.data?.id;
-    const qrImage = gwJson?.data?.qr_image;
-
-    if (!txnId || !qrImage) {
-      console.error('NeoXR missing fields:', JSON.stringify(gwJson).slice(0, 300));
-      return res.status(502).json({ error: 'Gateway tidak mengembalikan id/qr_image' });
-    }
-
-    // Save order to Supabase
+    // Save order
     const { error: oErr } = await db.from('orders').insert({
-      txn_id:         txnId,
-      product_id:     prod.id,
-      product_name:   prod.name,
-      category:       prod.category,
-      email:          email.toLowerCase().trim(),
-      whatsapp:       whatsapp.trim(),
-      duration,
-      duration_label: durLabel,
-      quantity:       qty,
-      total,
-      status: 'pending',
+      txn_id: txnId, product_id: prod.id, product_name: prod.name,
+      category: prod.category, email: email.toLowerCase().trim(),
+      whatsapp: whatsapp.trim(), duration, duration_label: durLabel,
+      quantity: qty, total, status: 'pending',
     });
+    if (oErr && !oErr.message?.includes('duplicate'))
+      return res.status(500).json({ error: 'Gagal menyimpan pesanan: ' + oErr.message });
 
-    if (oErr) {
-      // Ignore duplicate key (user re-submitted same payment)
-      if (!oErr.code?.includes('23505') && !oErr.message?.includes('duplicate')) {
-        console.error('Order insert error:', oErr);
-        return res.status(500).json({ error: 'Gagal menyimpan pesanan: ' + oErr.message });
-      }
-    }
-
-    return res.status(200).json({
-      txn_id:   txnId,
-      qr_image: qrImage,
-      pay_url:  gwJson?.data?.url || null,
-      total,
-    });
-
+    return res.status(200).json({ txn_id: txnId, qr_image: qrImage, pay_url: payUrl, total, expired_at: expiredAt, fee });
   } catch (err) {
-    console.error('Payment unhandled error:', err);
+    console.error('Payment error:', err);
     return res.status(500).json({ error: err.message || 'Internal server error' });
   }
-}
+      }
